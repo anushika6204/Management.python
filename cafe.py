@@ -1,0 +1,481 @@
+"""A small, persistent, terminal-based cafe management system."""
+
+from __future__ import annotations
+
+import sqlite3
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+
+
+DATABASE_PATH = Path(__file__).with_name("cafe.db")
+
+
+def parse_price(value: str) -> int:
+    """Convert a user-entered dollar amount to integer cents."""
+    try:
+        amount = Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError("Enter a valid price, such as 4.50.") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Price must be greater than zero.")
+    return int(amount * 100)
+
+
+def format_money(cents: int) -> str:
+    return f"${cents / 100:.2f}"
+
+
+class CafeStore:
+    """Owns cafe data and the transactions that keep it consistent."""
+
+    def __init__(self, database_path: Path = DATABASE_PATH) -> None:
+        self.connection = sqlite3.connect(database_path)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._initialize()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def _initialize(self) -> None:
+        with self.connection:
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS menu_items (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    price_cents INTEGER NOT NULL CHECK (price_cents > 0),
+                    stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+                );
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    customer TEXT NOT NULL DEFAULT '',
+                    table_number TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'paid', 'cancelled'))
+                );
+                CREATE TABLE IF NOT EXISTS order_items (
+                    id INTEGER PRIMARY KEY,
+                    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+                    menu_item_id INTEGER NOT NULL REFERENCES menu_items(id),
+                    item_name TEXT NOT NULL,
+                    unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents > 0),
+                    quantity INTEGER NOT NULL CHECK (quantity > 0)
+                );
+                """
+            )
+            count = self.connection.execute(
+                "SELECT COUNT(*) FROM menu_items"
+            ).fetchone()[0]
+            if count == 0:
+                self.connection.executemany(
+                    """
+                    INSERT INTO menu_items (name, price_cents, stock)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        ("Espresso", 300, 30),
+                        ("Cappuccino", 450, 25),
+                        ("Latte", 500, 25),
+                        ("Tea", 250, 30),
+                        ("Hot Chocolate", 475, 20),
+                        ("Blueberry Muffin", 350, 15),
+                        ("Croissant", 325, 15),
+                        ("Grilled Sandwich", 750, 12),
+                    ],
+                )
+
+    def list_menu(self, include_inactive: bool = False) -> list[sqlite3.Row]:
+        query = "SELECT id, name, price_cents, stock, active FROM menu_items"
+        if not include_inactive:
+            query += " WHERE active = 1"
+        return self.connection.execute(query + " ORDER BY id").fetchall()
+
+    def add_menu_item(self, name: str, price_cents: int, stock: int) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError("Item name cannot be blank.")
+        if price_cents <= 0:
+            raise ValueError("Price must be greater than zero.")
+        if stock < 0:
+            raise ValueError("Stock cannot be negative.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO menu_items (name, price_cents, stock) VALUES (?, ?, ?)",
+                (name, price_cents, stock),
+            )
+        return int(cursor.lastrowid)
+
+    def update_menu_item(self, item_id: int, name: str, price_cents: int) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError("Item name cannot be blank.")
+        if price_cents <= 0:
+            raise ValueError("Price must be greater than zero.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE menu_items SET name = ?, price_cents = ? WHERE id = ?",
+                (name, price_cents, item_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"No menu item has ID {item_id}.")
+
+    def set_menu_item_active(self, item_id: int, active: bool) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE menu_items SET active = ? WHERE id = ?",
+                (int(active), item_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"No menu item has ID {item_id}.")
+
+    def adjust_stock(self, item_id: int, change: int) -> int:
+        with self.connection:
+            item = self.connection.execute(
+                "SELECT stock FROM menu_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if item is None:
+                raise ValueError(f"No menu item has ID {item_id}.")
+            new_stock = item["stock"] + change
+            if new_stock < 0:
+                raise ValueError("Stock cannot be reduced below zero.")
+            self.connection.execute(
+                "UPDATE menu_items SET stock = ? WHERE id = ?",
+                (new_stock, item_id),
+            )
+        return new_stock
+
+    def create_order(
+        self,
+        customer: str,
+        table_number: str,
+        items: list[tuple[int, int]],
+    ) -> int:
+        quantities: dict[int, int] = {}
+        for item_id, quantity in items:
+            if quantity <= 0:
+                raise ValueError("Every order quantity must be greater than zero.")
+            quantities[item_id] = quantities.get(item_id, 0) + quantity
+        if not quantities:
+            raise ValueError("An order must contain at least one item.")
+
+        with self.connection:
+            order_id = self.connection.execute(
+                "INSERT INTO orders (customer, table_number) VALUES (?, ?)",
+                (customer.strip(), table_number.strip()),
+            ).lastrowid
+            for item_id, quantity in quantities.items():
+                item = self.connection.execute(
+                    """
+                    SELECT name, price_cents, stock FROM menu_items
+                    WHERE id = ? AND active = 1
+                    """,
+                    (item_id,),
+                ).fetchone()
+                if item is None:
+                    raise ValueError(f"Menu item {item_id} is unavailable.")
+                if item["stock"] < quantity:
+                    raise ValueError(
+                        f"Not enough stock for {item['name']}; "
+                        f"available: {item['stock']}."
+                    )
+                self.connection.execute(
+                    """
+                    INSERT INTO order_items
+                        (order_id, menu_item_id, item_name, unit_price_cents, quantity)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (order_id, item_id, item["name"], item["price_cents"], quantity),
+                )
+                self.connection.execute(
+                    "UPDATE menu_items SET stock = stock - ? WHERE id = ?",
+                    (quantity, item_id),
+                )
+        return int(order_id)
+
+    def list_orders(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT o.id, o.created_at, o.customer, o.table_number, o.status,
+                   COALESCE(SUM(oi.unit_price_cents * oi.quantity), 0) AS total_cents
+            FROM orders AS o
+            LEFT JOIN order_items AS oi ON oi.order_id = o.id
+            GROUP BY o.id
+            ORDER BY o.id DESC
+            """
+        ).fetchall()
+
+    def get_order(self, order_id: int) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+        order = self.connection.execute(
+            """
+            SELECT id, created_at, customer, table_number, status
+            FROM orders WHERE id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+        if order is None:
+            raise ValueError(f"No order has ID {order_id}.")
+        items = self.connection.execute(
+            """
+            SELECT item_name, unit_price_cents, quantity,
+                   unit_price_cents * quantity AS line_total_cents
+            FROM order_items WHERE order_id = ? ORDER BY id
+            """,
+            (order_id,),
+        ).fetchall()
+        return order, items
+
+    def mark_order_paid(self, order_id: int) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE orders SET status = 'paid' WHERE id = ? AND status = 'open'",
+                (order_id,),
+            )
+            if cursor.rowcount == 0:
+                self._raise_invalid_order_transition(order_id, "pay")
+
+    def cancel_order(self, order_id: int) -> None:
+        with self.connection:
+            order = self.connection.execute(
+                "SELECT status FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if order is None:
+                raise ValueError(f"No order has ID {order_id}.")
+            if order["status"] != "open":
+                raise ValueError("Only open orders can be cancelled.")
+            self.connection.execute(
+                """
+                UPDATE menu_items
+                SET stock = stock + (
+                    SELECT quantity FROM order_items
+                    WHERE order_items.menu_item_id = menu_items.id
+                      AND order_items.order_id = ?
+                )
+                WHERE id IN (
+                    SELECT menu_item_id FROM order_items WHERE order_id = ?
+                )
+                """,
+                (order_id, order_id),
+            )
+            self.connection.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE id = ?",
+                (order_id,),
+            )
+
+    def sales_summary(self) -> tuple[int, int]:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(DISTINCT o.id) AS order_count,
+                   COALESCE(SUM(oi.unit_price_cents * oi.quantity), 0) AS sales_cents
+            FROM orders AS o
+            LEFT JOIN order_items AS oi ON oi.order_id = o.id
+            WHERE o.status = 'paid'
+            """
+        ).fetchone()
+        return int(row["order_count"]), int(row["sales_cents"])
+
+    def _raise_invalid_order_transition(self, order_id: int, action: str) -> None:
+        order = self.connection.execute(
+            "SELECT status FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if order is None:
+            raise ValueError(f"No order has ID {order_id}.")
+        raise ValueError(
+            f"Cannot {action} order {order_id}: its status is {order['status']}."
+        )
+
+
+class CafeApp:
+    def __init__(self, store: CafeStore) -> None:
+        self.store = store
+
+    def run(self) -> None:
+        actions = {
+            "1": self._show_menu,
+            "2": self._create_order,
+            "3": self._show_orders,
+            "4": self._pay_order,
+            "5": self._cancel_order,
+            "6": self._show_inventory,
+            "7": self._adjust_stock,
+            "8": self._manage_menu,
+            "9": self._show_sales,
+        }
+        while True:
+            print(
+                "\n=== Cafe Management System ===\n"
+                "1. View menu\n"
+                "2. Create order\n"
+                "3. View orders / receipt\n"
+                "4. Record payment\n"
+                "5. Cancel open order\n"
+                "6. View inventory\n"
+                "7. Adjust inventory\n"
+                "8. Manage menu\n"
+                "9. Sales summary\n"
+                "0. Exit"
+            )
+            choice = input("Choose an option: ").strip()
+            if choice == "0":
+                print("Goodbye!")
+                return
+            action = actions.get(choice)
+            if action is None:
+                print("Please choose a number from 0 to 9.")
+                continue
+            try:
+                action()
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                print(f"Error: {exc}")
+
+    def _show_menu(self) -> None:
+        print("\n--- Menu ---")
+        self._print_items(self.store.list_menu())
+
+    def _create_order(self) -> None:
+        self._show_menu()
+        customer = input("Customer name (optional): ").strip()
+        table_number = input("Table number (optional): ").strip()
+        items: list[tuple[int, int]] = []
+        print("Enter item IDs and quantities; leave item ID blank to finish.")
+        while True:
+            item_text = input("Item ID: ").strip()
+            if not item_text:
+                break
+            item_id = self._read_int(item_text, "Item ID")
+            quantity = self._read_int(input("Quantity: "), "Quantity")
+            items.append((item_id, quantity))
+        order_id = self.store.create_order(customer, table_number, items)
+        print(f"Order #{order_id} created.")
+        self._print_receipt(order_id)
+
+    def _show_orders(self) -> None:
+        orders = self.store.list_orders()
+        if not orders:
+            print("No orders yet.")
+            return
+        print("\n--- Orders ---")
+        for order in orders:
+            table = f" | Table {order['table_number']}" if order["table_number"] else ""
+            customer = f" | {order['customer']}" if order["customer"] else ""
+            print(
+                f"#{order['id']} | {order['created_at']} | {order['status'].upper()}"
+                f"{customer}{table} | {format_money(order['total_cents'])}"
+            )
+        order_id = self._read_optional_id("Enter an order ID for its receipt: ")
+        if order_id is not None:
+            self._print_receipt(order_id)
+
+    def _pay_order(self) -> None:
+        order_id = self._read_int(input("Order ID to mark paid: "), "Order ID")
+        self.store.mark_order_paid(order_id)
+        print(f"Order #{order_id} marked as paid.")
+
+    def _cancel_order(self) -> None:
+        order_id = self._read_int(input("Open order ID to cancel: "), "Order ID")
+        self.store.cancel_order(order_id)
+        print(f"Order #{order_id} cancelled and stock restored.")
+
+    def _show_inventory(self) -> None:
+        print("\n--- Inventory ---")
+        self._print_items(self.store.list_menu(include_inactive=True))
+
+    def _adjust_stock(self) -> None:
+        item_id = self._read_int(input("Item ID: "), "Item ID")
+        change = self._read_int(input("Stock change (use a negative number to remove): "), "Change")
+        new_stock = self.store.adjust_stock(item_id, change)
+        print(f"Stock for item #{item_id} is now {new_stock}.")
+
+    def _manage_menu(self) -> None:
+        print("\n--- Menu Management ---")
+        print("1. Add item\n2. Update item name/price\n3. Activate/deactivate item")
+        choice = input("Choose an option: ").strip()
+        if choice == "1":
+            name = input("Item name: ")
+            price_cents = parse_price(input("Price: $"))
+            stock = self._read_int(input("Starting stock: "), "Stock")
+            item_id = self.store.add_menu_item(name, price_cents, stock)
+            print(f"Added {name.strip()} as item #{item_id}.")
+        elif choice == "2":
+            item_id = self._read_int(input("Item ID: "), "Item ID")
+            name = input("New name: ")
+            price_cents = parse_price(input("New price: $"))
+            self.store.update_menu_item(item_id, name, price_cents)
+            print(f"Item #{item_id} updated.")
+        elif choice == "3":
+            item_id = self._read_int(input("Item ID: "), "Item ID")
+            active = input("Activate item? (y/n): ").strip().lower()
+            if active not in {"y", "n"}:
+                raise ValueError("Enter y or n.")
+            self.store.set_menu_item_active(item_id, active == "y")
+            print(f"Item #{item_id} updated.")
+        else:
+            print("No menu changes made.")
+
+    def _show_sales(self) -> None:
+        order_count, sales_cents = self.store.sales_summary()
+        print("\n--- Sales Summary ---")
+        print(f"Paid orders: {order_count}")
+        print(f"Total sales: {format_money(sales_cents)}")
+
+    def _print_receipt(self, order_id: int) -> None:
+        order, items = self.store.get_order(order_id)
+        print(f"\n--- Receipt for order #{order_id} ---")
+        print(f"Date: {order['created_at']}")
+        print(f"Status: {order['status'].upper()}")
+        if order["customer"]:
+            print(f"Customer: {order['customer']}")
+        if order["table_number"]:
+            print(f"Table: {order['table_number']}")
+        total = 0
+        for item in items:
+            line_total = item["line_total_cents"]
+            total += line_total
+            print(
+                f"{item['item_name']} x{item['quantity']} "
+                f"@ {format_money(item['unit_price_cents'])} = {format_money(line_total)}"
+            )
+        print(f"TOTAL: {format_money(total)}")
+
+    @staticmethod
+    def _print_items(items: list[sqlite3.Row]) -> None:
+        if not items:
+            print("No menu items.")
+            return
+        print(f"{'ID':<4} {'Item':<25} {'Price':>9} {'Stock':>8} {'Status':>10}")
+        for item in items:
+            status = "Active" if item["active"] else "Inactive"
+            print(
+                f"{item['id']:<4} {item['name']:<25} "
+                f"{format_money(item['price_cents']):>9} "
+                f"{item['stock']:>8} {status:>10}"
+            )
+
+    @staticmethod
+    def _read_int(value: str, label: str) -> int:
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a whole number.") from exc
+
+    def _read_optional_id(self, prompt: str) -> int | None:
+        value = input(prompt).strip()
+        if not value:
+            return None
+        return self._read_int(value, "Order ID")
+
+
+def main() -> None:
+    store = CafeStore()
+    try:
+        CafeApp(store).run()
+    except (EOFError, KeyboardInterrupt):
+        print("\nGoodbye!")
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    main()
